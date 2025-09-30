@@ -1,0 +1,10 @@
+{
+    "Not": {
+      "Or": [
+        {"Dimensions": {"Key": "SERVICE", "Values": ["Solution Provider Program Discount"]}},
+        {"Dimensions": {"Key": "SERVICE", "Values": ["Savings Plans"]}},
+        {"Dimensions": {"Key": "SERVICE", "Values": ["Tax"]}}
+      ]
+    }
+  }
+  

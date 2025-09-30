@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# scripts/use-aws
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: use-aws <profile> [region]" >&2
+  exit 2
+fi
+
+PROFILE="$1"
+REGION="${2:-$(aws configure get region --profile "$PROFILE" 2>/dev/null || echo eu-west-1)}"
+
+ensure_creds() {
+  # נסה לייצא קרדנצ'יאלס ללא פתיחת דפדפן
+  if eval "$(aws configure export-credentials --profile "$PROFILE" --format env 2>/dev/null)"; then
+    return 0
+  fi
+
+  # אם נכשל (לרוב SSO פג) – רענון SSO רק עכשיו
+  echo "[use-aws] SSO seems expired; refreshing abra-payer SSO..." >&2
+  aws sso login --profile abra-payer
+
+  # נסה שוב לייצא קרדנצ'יאלס
+  eval "$(aws configure export-credentials --profile "$PROFILE" --format env)"
+}
+
+# 1) ודא קרדנצ'יאלס (פותח דפדפן רק אם חייבים)
+ensure_creds
+
+# 2) נעל סביבה לכל הכלים
+export AWS_PROFILE="$PROFILE"
+export AWS_DEFAULT_REGION="$REGION"
+export AWS_SDK_LOAD_CONFIG=1
+
+# 3) הוכחת זהות
+aws sts get-caller-identity --no-cli-pager
+echo "[use-aws] active profile: $PROFILE | region: $AWS_DEFAULT_REGION"

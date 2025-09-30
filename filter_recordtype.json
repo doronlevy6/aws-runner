@@ -1,0 +1,9 @@
+{
+    "Not": {
+      "Dimensions": {
+        "Key": "RECORD_TYPE",
+        "Values": ["Refund", "Credit", "Discount", "Tax"]
+      }
+    }
+  }
+  

@@ -1,0 +1,9 @@
+{
+    "Not": {
+      "Dimensions": {
+        "Key": "RECORD_TYPE",
+        "Values": ["Tax", "Solution Provider Program Discount"]
+      }
+    }
+  }
+  
