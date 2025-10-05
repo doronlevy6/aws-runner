@@ -1,31 +1,39 @@
+# scripts/ce_payers_totals.py
 #!/usr/bin/env python3
 # =====================================================================
 # File: scripts/ce_payers_totals.py
 #
 # What it does:
 #   Iterates over a configured list of payer/management profiles.
-#   For each payer, writes rows in unified schema:
-#       account_id,account_name,kind,total_unblended_cost
-#   where kind ∈ {"usage","MP"}.
+#   For each payer, writes rows in unified schema (final order):
+#       account_id,account_name,total_unblended_cost,kind
+#   where:
+#     - kind = ""   -> usage (excludes AWS Marketplace, Tax, SPP; see FILTER_MODE)
+#     - kind = "mp" -> AWS Marketplace only (Tax excluded in ui/full)
 #
 # Rules:
-#   - "usage": excludes RECORD_TYPE in {Tax, Solution Provider Program Discount, Marketplace}
-#   - "MP":    includes only RECORD_TYPE=Marketplace
+#   - Marketplace is detected via BILLING_ENTITY = "AWS Marketplace".
+#   - Usage is "everything except Marketplace" (+ optionally excludes
+#     Tax / SPP / Refund / Credit / Discount according to FILTER_MODE).
 #   - MP row is written ONLY if total > 0.00
 #   - Amounts formatted with thousand separators and 2 decimals.
 #
-# Run:   python scripts/ce_payers_totals.py
-# Output: out/ce_payers_totals_<filter_mode>_<timestamp>.csv
+# FILTER_MODE:
+#   - "none": Usage = not MP; MP = MP (gross, includes Tax).
+#   - "ui":   Usage = not MP and not {Tax, SPP}; MP = MP and not {Tax}.
+#   - "full": Usage = not MP and not {Refund,Credit,Discount,Tax};
+#             MP    = MP and not {Refund,Credit,Discount,Tax}.
+#
+# Run:
+#   python scripts/ce_payers_totals.py
+#
+# Output:
+#   out/ce_payers_totals_<filter_mode>_<timestamp>.csv
 # =====================================================================
-
-
-
 import os, csv, datetime
 from decimal import Decimal
 import boto3
 from botocore.config import Config
-
-print("[ce_payers_totals] running from:", os.path.abspath(__file__))
 
 # ---------------- CONFIG ----------------
 START_DAY, START_MONTH, START_YEAR = 1, 9, 2025
@@ -39,7 +47,7 @@ SERVICE_EXCLUDE_LIST = [
 ]
 
 PAYER_PROFILES = [
-    "altahq-from-abra","biz-from-abra","bot-authority","cobra-mgt-from-abra",
+    "altahq-from-abra","biz-from-abra","bot-authority","cobra-mgt",
     "aidome","coinmarket","communi","genoox","imagry","jobtestprep","nanox",
     "onriva","owlduet","partake","senseip","storeman","three-spring-media",
     "vsee","wallter","yes-management","zoozpower",
@@ -54,17 +62,42 @@ def iso_date(y,m,d):
     import datetime as _dt
     return _dt.date(y,m,d).isoformat()
 
-def build_filter_by_mode(mode: str):
+def build_filters(mode: str):
+    """
+    Returns (usage_filter, mp_filter)
+    Usage  = הכל פחות AWS Marketplace ופחות מס/הנחות לפי מצב
+    MP     = BILLING_ENTITY='AWS Marketplace' וללא Tax (וב-'full' גם Refund/Credit/Discount)
+    """
+    mp_base = {"Dimensions": {"Key": "BILLING_ENTITY", "Values": ["AWS Marketplace"]}}
+
     if mode == "none":
-        return None
+        usage = {"Not": mp_base}
+        mp    = mp_base  # ברוטו כולל מס
+        return usage, mp
+
     if mode == "ui":
-        return {"Not":{"Dimensions":{"Key":"RECORD_TYPE","Values":["Tax","Solution Provider Program Discount"]}}}
+        usage_parts = [
+            {"Not": mp_base},
+            {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Tax", "Solution Provider Program Discount"]}}},
+        ]
+        mp_parts = [
+            mp_base,
+            {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Tax"]}}},  # נטו ללא מס
+        ]
+        return {"And": usage_parts}, {"And": mp_parts}
+
     if mode == "full":
-        parts=[{"Not":{"Dimensions":{"Key":"RECORD_TYPE","Values":["Refund","Credit","Discount","Tax"]}}}]
-        if SERVICE_EXCLUDE_LIST:
-            parts.append({"Not":{"Or":[{"Dimensions":{"Key":"SERVICE","Values":[s]}} for s in SERVICE_EXCLUDE_LIST]}})
-        return {"And":parts}
-    return None
+        usage_parts = [
+            {"Not": mp_base},
+            {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Refund","Credit","Discount","Tax"]}}},
+        ]
+        mp_parts = [
+            mp_base,
+            {"Not": {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Refund","Credit","Discount","Tax"]}}},
+        ]
+        return {"And": usage_parts}, {"And": mp_parts}
+
+    return None, mp_base
 
 def clients_for_profile(profile: str):
     region = os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
@@ -94,25 +127,25 @@ def account_name(org, account_id: str, fallback: str):
 def main():
     import datetime as _dt
     start_iso = iso_date(START_YEAR,START_MONTH,START_DAY)
-    end_iso   = ( _dt.date(END_YEAR,END_MONTH,END_DAY) + _dt.timedelta(days=1) ).isoformat()
-    ce_filter = build_filter_by_mode(FILTER_MODE)
+    end_iso   = (_dt.date(END_YEAR,END_MONTH,END_DAY) + _dt.timedelta(days=1)).isoformat()
+    usage_filter, mp_filter = build_filters(FILTER_MODE)
 
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
-    print("[ce_payers_totals] SCHEMA -> account_id,account_name,total_unblended_cost")
-
     with open(OUT_CSV,"w",newline="",encoding="utf-8") as fh:
         w=csv.writer(fh)
-        w.writerow(["account_id","account_name","total_unblended_cost"])
+        w.writerow(["account_id","account_name","total_unblended_cost","kind"])
 
         for profile in PAYER_PROFILES:
             ce, sts, org = clients_for_profile(profile)
             acct_id = sts.get_caller_identity().get("Account", profile)
             name    = account_name(org, acct_id, profile)
-            total   = get_total_for_period(ce, start_iso, end_iso, ce_filter)
 
-            formatted_total = f"{total:,.2f}"  # פסיקים + שתי ספרות
-            w.writerow([str(acct_id), name, formatted_total])
-            print(f"[ce_payers_totals] wrote row -> {acct_id},{name},{formatted_total}")
+            usage_total = get_total_for_period(ce, start_iso, end_iso, usage_filter)
+            mp_total    = get_total_for_period(ce, start_iso, end_iso, mp_filter)
+
+            w.writerow([str(acct_id), name, f"{usage_total:,.2f}", ""])
+            if mp_total > 0:
+                w.writerow([str(acct_id), name, f"{mp_total:,.2f}", "mp"])
 
     print(f"Done. Wrote {OUT_CSV}")
 
