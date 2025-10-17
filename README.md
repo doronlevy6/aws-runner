@@ -1,58 +1,113 @@
-# aws-runner
-Run small FinOps scripts against a chosen AWS profile (SSO/STS via ~/.aws/config). Outputs saved to ./out/.
-Basic scripts:
-- whoami: prints STS identity (account/arn)
-- ce_monthly: Cost Explorer monthly cost between dates (us-east-1)
-- cw_probe: tiny CloudWatch probe to verify access
+# Abra AWS Runner — Usage Guide
 
-Here’s a short, clean README.md section you can drop in as-is:
+## 🌝 Overview
 
-## Quick AWS Account Switching
+This project provides automation scripts for accessing and analyzing AWS accounts managed under the Abra payer organization via AWS SSO.
 
-This repo includes a helper script `scripts/use-aws` that locks your shell to any AWS profile defined in `~/.aws/config`. After switching, every AWS CLI/Python/Terraform command will run inside that account without adding `--profile`.
+## ⚙️ Prerequisites
 
-### One-time setup
+* AWS CLI v2 configured with profiles in `~/.aws/config`
+* Python virtual environment in `.venv`
+* Bash script `scripts/use-aws` (included)
+
+## 🚀 Workflow
+
+### 1. Login to SSO (once per day)
+
+Run this command **once at the start of your workday** to authenticate your SSO session:
+
 ```bash
-# Install Python dependencies if needed
-pip install -U boto3 botocore
-
-# Log in to Abra payer (SSO root)
 aws sso login --profile abra-payer
+```
 
-Switch accounts
-# Syntax:
-scripts/use-aws <profile> [region]
+🟢 You only need to do this once a day.
+After that, your SSO session remains active, and you can switch between accounts freely without re-logging in.
 
-# Examples:
-scripts/use-aws alta-prod
-scripts/use-aws alta-dev
-scripts/use-aws cobra-sap-prod
-scripts/use-aws cobra-car-plus
+### 2. Load target account (switch between accounts as needed)
 
+Once SSO is active, use the following command to switch accounts:
 
-The script:
+```bash
+source scripts/use-aws <profile-name>
+```
 
-Ensures Abra SSO is valid.
+Example:
 
-Exports temporary credentials for the selected profile.
+```bash
+source scripts/use-aws fpaas-dev
+```
 
-Sets AWS_PROFILE, AWS_DEFAULT_REGION, AWS_SDK_LOAD_CONFIG=1.
+This sets your AWS credentials and region automatically, verifies identity with `aws sts get-caller-identity`, and refreshes SSO if needed.
 
-Runs aws sts get-caller-identity to confirm.
+### 3. Activate Python environment
 
-Run commands in the active account
-# Python scripts
-python scripts/whoami.py
-python scripts/ec2_inventory.py
+Activate the local Python virtual environment before running scripts:
 
-# AWS CLI
-aws ec2 describe-instances --no-cli-pager
-aws ce get-cost-and-usage --time-period Start=2025-09-01,End=2025-10-01 --granularity MONTHLY --metrics UnblendedCost
+```bash
+source .venv/bin/activate
+```
 
-Switch to another account
-scripts/use-aws cobra-car-plus
-python scripts/ec2_efficiency_metrics.py
+### 4. Run FinOps scripts
 
-If you see “No AWS credentials/session”
-aws sso login --profile abra-payer
-scripts/use-aws <profile>
+Once your environment is active, you can execute any of your automation scripts, for example:
+
+```bash
+python scripts/ce_all_accounts.py
+```
+
+## 💡 Tips
+
+* `aws sso login --profile abra-payer` → **run once per day** to start your session.
+* `source scripts/use-aws <profile>` → **use whenever you want to switch accounts**.
+* The script automatically refreshes your SSO session if it has expired.
+* Default AWS region is `eu-west-1`.
+* To verify which account is currently active:
+
+  ```bash
+  aws sts get-caller-identity
+  ```
+
+## 🔁 Quick Start Examples
+
+### 🕐 At the start of the day (first login)
+
+Run once:
+
+```bash
+aws sso login --profile abra-payer && source scripts/use-aws abra-payer && source .venv/bin/activate
+```
+
+### 🔄 Switching to another account later (no need to log in again)
+
+```bash
+source scripts/use-aws <profile-name> && source .venv/bin/activate
+```
+
+Example:
+
+```bash
+source scripts/use-aws fpaas-dev && source .venv/bin/activate
+```
+
+## 🧱 Project Structure Example
+
+```
+aws-runner/
+├── .venv/
+├── scripts/
+│   ├── use-aws
+│   ├── ce_all_accounts.py
+│   ├── ce_payers_totals.py
+│   └── run_ce_merge.py
+├── README.md
+└── .aws/
+    └── config
+```
+
+## ✅ Summary
+
+* Perform `aws sso login --profile abra-payer` **once a day**.
+* Use `source scripts/use-aws <profile>` to switch between customer accounts.
+* Activate your Python environment with `source .venv/bin/activate`.
+* Run FinOps scripts as needed.
+* Everything else (credentials, refreshes, region) happens automatically.
