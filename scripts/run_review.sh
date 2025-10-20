@@ -34,8 +34,13 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.rds_rightsizing.run "$@"
     ;;
+  rds_storage_audit)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.rds_storage_audit.run "$@"
+    ;;
   *)
     echo "Unknown review: $REVIEW" >&2
     exit 2
     ;;
 esac
+
