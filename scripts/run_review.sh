@@ -38,6 +38,13 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.rds_storage_audit.run "$@"
     ;;
+  # תוספת ל-scripts/run_review.sh (בלוק case)
+  ecs_rightsizing)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.ecs_rightsizing.run "$@"
+    ;;
+
+    
   *)
     echo "Unknown review: $REVIEW" >&2
     exit 2
