@@ -43,6 +43,11 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.ecs_rightsizing.run "$@"
     ;;
+    ec2_utilization)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.ec2_utilization.run "$@"
+    ;;
+  
 
     
   *)
