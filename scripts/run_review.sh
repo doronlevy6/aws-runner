@@ -43,11 +43,16 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.ecs_rightsizing.run "$@"
     ;;
-    ec2_utilization)
+  cloudfront_global_metrics)
     cd "$REPO_DIR"
-    exec "$PY" -m scripts.reviews.ec2_utilization.run "$@"
+    exec "$PY" -m scripts.reviews.cloudfront_global_metrics.run "$@"
     ;;
-  
+
+  cloudfront_distributions_config)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.cloudfront_distributions_config.run "$@"
+    ;;
+
 
     
   *)
