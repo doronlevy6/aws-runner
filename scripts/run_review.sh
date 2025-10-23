@@ -1,3 +1,4 @@
+#scripts/run_review.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -43,10 +44,11 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.ecs_rightsizing.run "$@"
     ;;
-  cloudfront_global_metrics)
+  amazon_mq_finops)
     cd "$REPO_DIR"
-    exec "$PY" -m scripts.reviews.cloudfront_global_metrics.run "$@"
+    exec "$PY" -m scripts.reviews.amazon_mq_finops.run "$@"
     ;;
+
 
   cloudfront_distributions_config)
     cd "$REPO_DIR"
