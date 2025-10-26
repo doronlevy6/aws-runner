@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
+scripts/rr_ecs.sh us-east-1,eu-east-2 tea-fi steam-fi
+
 ECS Rightsizing Collector — Extended (DATA ONLY, FinOps-ready)
 אוסף נתונים מקיפים לזיהוי חוסר פעילות וריסייזינג אפשרי ב-ECS.
 כולל:

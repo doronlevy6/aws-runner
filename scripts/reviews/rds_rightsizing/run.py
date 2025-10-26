@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
+scripts/run_review.sh rds_rightsizing --profiles tea-fi steam-fi --regions us-east-1,us-east-2
+
 RDS/Aurora Rightsizing Collector — Minimal (DATA ONLY)
 אוסף רק נתונים הכרחיים להחלטה עתידית על ריסייזינג.
 אין חישובי שעות/תמחור/Latency/Throughput/המלצות.

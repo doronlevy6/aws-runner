@@ -48,6 +48,11 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.amazon_mq_finops.run "$@"
     ;;
+  ec2_utilization)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.ec2_utilization.run "$@"
+    ;;
+
 
 
   cloudfront_distributions_config)

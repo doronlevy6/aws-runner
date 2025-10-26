@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
+scripts/run_review.sh rds_storage_audit --profiles tea-fi steam-fi --regions us-east-1,us-east-2
+
 RDS Storage Audit — Unified Review (Backups & Snapshots)
 (גרסה ללא חישוב עלות)
+
 """
 
 import argparse

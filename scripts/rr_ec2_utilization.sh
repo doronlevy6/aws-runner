@@ -8,3 +8,4 @@ if [[ ${#profiles[@]} -eq 0 ]]; then
   exit 2
 fi
 scripts/run_review.sh ec2_utilization --regions "$regions" --profiles "${profiles[@]}"
+---

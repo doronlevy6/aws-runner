@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
+scripts/rr_ec2_utilization.sh us-east-1,us-east-2 tea-fi steam-fi
+scripts/run_review.sh ec2_utilization --profiles tea-fi steam-fi --regions us-east-1,us-east-2
+
+
+
 EC2 Utilization Audit + Infra Complements (EBS / Snapshots / EIPs / NAT)
 - Keeps original EC2 utilization outputs intact
 - Adds additional CSVs for EBS volumes, snapshots, EIPs, NAT Gateways
