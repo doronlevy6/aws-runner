@@ -1,0 +1,2 @@
+profile,account_id,region,db_instance_id,engine,db_instance_class,multi_az,availability_zone,vpc_id,aurora_cluster_id,storage_type,allocated_storage_gib,provisioned_iops,iops_cap_note,cpu_avg_pct,cpu_p95_pct,freeable_mem_avg_gib,connections_avg,read_iops_p95,write_iops_p95,iops_util_pct
+steam-fi,126271034052,us-east-1,prod-rds-postgresql,postgres,db.t4g.medium,True,us-east-1b,vpc-033fd8e6a0e3c8f87,,gp3,100,3000,gp3 baseline if not set,4.489670392325143,5.25194099490912,2.086447058230465,12.011936155447607,0.4449434824918591,5.609747194283275,0.18699157314277584
