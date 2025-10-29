@@ -52,9 +52,10 @@ case "$REVIEW" in
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.ec2_utilization.run "$@"
     ;;
-
-
-
+  s3_cost_analysis)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.s3_cost_analysis.run "$@"
+    ;;
   cloudfront_distributions_config)
     cd "$REPO_DIR"
     exec "$PY" -m scripts.reviews.cloudfront_distributions_config.run "$@"
@@ -67,4 +68,3 @@ case "$REVIEW" in
     exit 2
     ;;
 esac
-

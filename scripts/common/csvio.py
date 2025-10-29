@@ -15,3 +15,22 @@ def write_csv(path: str, rows: List[Dict], field_order: Sequence[str]) -> None:
         w.writeheader()
         for r in rows:
             w.writerow(r)
+
+def write_rows(path: str, rows: List[Dict]) -> None:
+    """
+    Convenience writer that infers field order from the rows (in encounter order).
+    """
+    ensure_dir(os.path.dirname(path))
+    if not rows:
+        # create empty file with no header (consistent with zero results)
+        with open(path, "w", encoding="utf-8"):
+            pass
+        return
+
+    field_order: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in field_order:
+                field_order.append(key)
+
+    write_csv(path, rows, field_order)
