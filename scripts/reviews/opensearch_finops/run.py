@@ -48,7 +48,8 @@ class WindowSpec:
 
 WINDOWS: Dict[str, WindowSpec] = {
     "24h": WindowSpec("24h", 1, 300),
-    "7d": WindowSpec("7d", 7, 300),
+    # 7d window needs a >= 5min period to stay under the 1,440-point CloudWatch limit
+    "7d": WindowSpec("7d", 7, 900),
     "30d": WindowSpec("30d", 30, 3600),
 }
 
