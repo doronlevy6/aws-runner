@@ -61,8 +61,13 @@ case "$REVIEW" in
     exec "$PY" -m scripts.reviews.cloudfront_distributions_config.run "$@"
     ;;
 
+  opensearch_finops)
+    cd "$REPO_DIR"
+    exec "$PY" -m scripts.reviews.opensearch_finops.run "$@"
+    ;;
 
-    
+
+
   *)
     echo "Unknown review: $REVIEW" >&2
     exit 2
