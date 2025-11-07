@@ -1,0 +1,1 @@
+"""OpenSearch FinOps review package."""
