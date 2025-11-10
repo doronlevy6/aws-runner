@@ -48,6 +48,9 @@ CSV_FIELDS: Sequence[str] = (
     "avg_1d_throttle",
     "peak_1d_throttle",
     "p95_1d_throttle",
+    "avgmax_1d_read",
+    "avgmax_1d_write",
+    "avgmax_1d_throttle",
     "avg_7d_read",
     "peak_7d_read",
     "p95_7d_read",
@@ -57,6 +60,9 @@ CSV_FIELDS: Sequence[str] = (
     "avg_7d_throttle",
     "peak_7d_throttle",
     "p95_7d_throttle",
+    "avgmax_7d_read",
+    "avgmax_7d_write",
+    "avgmax_7d_throttle",
     "avg_30d_read",
     "peak_30d_read",
     "p95_30d_read",
@@ -66,8 +72,15 @@ CSV_FIELDS: Sequence[str] = (
     "avg_30d_throttle",
     "peak_30d_throttle",
     "p95_30d_throttle",
+    "avgmax_30d_read",
+    "avgmax_30d_write",
+    "avgmax_30d_throttle",
     "stability_7d_read",
     "stability_7d_write",
+    "stability_7d_p95_ratio",
+    "spike_ratio_7d",
+    "throttle_indicator",
+    "confidence_score",
     "recommendation",
     "Tags",
 )
@@ -84,6 +97,9 @@ class MetricAggregate:
     avg: float = 0.0
     peak: float = 0.0
     p95: float = 0.0
+    spike_count: int = 0
+    samples_count: int = 0
+    avg_max: float = 0.0
 
 
 @dataclass
@@ -125,12 +141,30 @@ def summarize_datapoints(datapoints: Iterable[Dict]) -> MetricAggregate:
     avg_vals: List[float] = []
     max_vals: List[float] = []
     p95_vals: List[float] = []
+    spike_count = 0
+    samples_count = 0
 
     for dp in datapoints:
+        avg_val = None
+        max_val = None
         if "Average" in dp:
-            avg_vals.append(float(dp["Average"]))
+            try:
+                avg_val = float(dp["Average"])
+            except (TypeError, ValueError):
+                avg_val = None
+            if avg_val is not None:
+                avg_vals.append(avg_val)
         if "Maximum" in dp:
-            max_vals.append(float(dp["Maximum"]))
+            try:
+                max_val = float(dp["Maximum"])
+            except (TypeError, ValueError):
+                max_val = None
+            if max_val is not None:
+                max_vals.append(max_val)
+        if avg_val is not None or max_val is not None:
+            samples_count += 1
+        if avg_val and max_val and avg_val > 0 and max_val >= avg_val * 2:
+            spike_count += 1
         ext = dp.get("ExtendedStatistics")
         if isinstance(ext, dict) and "p95" in ext:
             try:
@@ -141,7 +175,15 @@ def summarize_datapoints(datapoints: Iterable[Dict]) -> MetricAggregate:
     avg = sum(avg_vals) / len(avg_vals) if avg_vals else 0.0
     peak = max(max_vals) if max_vals else 0.0
     p95 = percentile(p95_vals, 95.0) if p95_vals else 0.0
-    return MetricAggregate(avg=avg, peak=peak, p95=p95)
+    avg_max = sum(max_vals) / len(max_vals) if max_vals else 0.0
+    return MetricAggregate(
+        avg=avg,
+        peak=peak,
+        p95=p95,
+        spike_count=spike_count,
+        samples_count=samples_count,
+        avg_max=avg_max,
+    )
 
 
 def fetch_metric_bundle(cw, table_name: str) -> MetricBundle:
@@ -299,26 +341,51 @@ def collect_region(session, region: str) -> Tuple[List[Dict], Dict[str, int]]:
             row[f"avg_{window_name}_read"] = round(read_agg.avg, 4)
             row[f"peak_{window_name}_read"] = round(read_agg.peak, 4)
             row[f"p95_{window_name}_read"] = round(read_agg.p95, 4)
+            row[f"avgmax_{window_name}_read"] = round(read_agg.avg_max, 4)
 
             row[f"avg_{window_name}_write"] = round(write_agg.avg, 4)
             row[f"peak_{window_name}_write"] = round(write_agg.peak, 4)
             row[f"p95_{window_name}_write"] = round(write_agg.p95, 4)
+            row[f"avgmax_{window_name}_write"] = round(write_agg.avg_max, 4)
 
             row[f"avg_{window_name}_throttle"] = round(throttle_agg.avg, 4)
             row[f"peak_{window_name}_throttle"] = round(throttle_agg.peak, 4)
             row[f"p95_{window_name}_throttle"] = round(throttle_agg.p95, 4)
+            row[f"avgmax_{window_name}_throttle"] = round(throttle_agg.avg_max, 4)
 
         read_7d = bundle.read.get("7d")
         write_7d = bundle.write.get("7d")
+
+        p95_sum = (read_7d.p95 if read_7d else 0.0) + (write_7d.p95 if write_7d else 0.0)
+        avg_sum = (read_7d.avg if read_7d else 0.0) + (write_7d.avg if write_7d else 0.0)
+        stability_7d_p95_ratio = (p95_sum / avg_sum) if avg_sum else 0.0
+
+        samples_7d = (read_7d.samples_count if read_7d else 0) + (
+            write_7d.samples_count if write_7d else 0
+        )
+        spikes_7d = (read_7d.spike_count if read_7d else 0) + (
+            write_7d.spike_count if write_7d else 0
+        )
+        spike_ratio_7d = (spikes_7d / samples_7d) if samples_7d else 0.0
+
+        throttle_7d = bundle.throttle.get("7d")
+        throttle_30d = bundle.throttle.get("30d")
+        avg_7d_throttle = throttle_7d.avg if throttle_7d else 0.0
+        avg_30d_throttle = throttle_30d.avg if throttle_30d else 0.0
+        throttle_indicator = (avg_7d_throttle + avg_30d_throttle) / 2.0
 
         stability_read = stability_ratio(read_7d.peak, read_7d.avg) if read_7d else 0.0
         stability_write = stability_ratio(write_7d.peak, write_7d.avg) if write_7d else 0.0
 
         row["stability_7d_read"] = round(stability_read, 4) if stability_read else 0.0
         row["stability_7d_write"] = round(stability_write, 4) if stability_write else 0.0
+        row["stability_7d_p95_ratio"] = round(stability_7d_p95_ratio, 4)
+        row["spike_ratio_7d"] = round(spike_ratio_7d, 4)
+        row["throttle_indicator"] = round(throttle_indicator, 4)
 
         recommendation = render_recommendation(bundle, row)
         row["recommendation"] = recommendation
+        row["confidence_score"] = round(row.get("confidence_score", 0.0), 4)
 
         if "Tags" not in row:
             row["Tags"] = ""
