@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import math
 from botocore.config import Config as BotoConfig
 
@@ -60,6 +60,34 @@ def get_metric_series(
     )
     dps = sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
     return [float(dp[stat]) for dp in dps if stat in dp]
+
+
+def get_metric_statistics_multi(
+    cw_client,
+    namespace: str,
+    metric_name: str,
+    dimensions: List[Dict[str, str]],
+    start: datetime,
+    end: datetime,
+    period: int,
+    statistics: Optional[Sequence[str]] = None,
+    extended_statistics: Optional[Sequence[str]] = None,
+):
+    params: Dict = {
+        "Namespace": namespace,
+        "MetricName": metric_name,
+        "Dimensions": dimensions,
+        "StartTime": start,
+        "EndTime": end,
+        "Period": period,
+    }
+    if statistics:
+        params["Statistics"] = list(statistics)
+    if extended_statistics:
+        params["ExtendedStatistics"] = list(extended_statistics)
+
+    resp = cw_client.get_metric_statistics(**params)
+    return sorted(resp.get("Datapoints", []), key=lambda d: d["Timestamp"])
 
 # ----- RDS helpers -----
 def rds_dim(db_instance_id: str) -> List[Dict[str, str]]:

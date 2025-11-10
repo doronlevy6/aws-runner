@@ -61,8 +61,57 @@ case "$REVIEW" in
     exec "$PY" -m scripts.reviews.cloudfront_distributions_config.run "$@"
     ;;
 
+  dynamodb_finops)
+    region_arg=""
+    profiles=()
 
-    
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --regions)
+          if [[ $# -lt 2 ]]; then
+            echo "--regions requires an argument" >&2
+            exit 2
+          fi
+          region_arg="$2"
+          shift 2
+          ;;
+        --profiles)
+          shift
+          while [[ $# -gt 0 && $1 != --* ]]; do
+            profiles+=("$1")
+            shift
+          done
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+
+    if [[ -z "$region_arg" ]]; then
+      echo "dynamodb_finops requires --regions" >&2
+      exit 2
+    fi
+    if [[ ${#profiles[@]} -eq 0 ]]; then
+      echo "dynamodb_finops requires at least one --profiles entry" >&2
+      exit 2
+    fi
+
+    IFS=',' read -r -a region_list <<< "$region_arg"
+    for profile in "${profiles[@]}"; do
+      for region in "${region_list[@]}"; do
+        region_trimmed="${region//[[:space:]]/}"
+        if [[ -z "$region_trimmed" ]]; then
+          continue
+        fi
+        "${SCRIPT_DIR}/rr_dynamodb_finops.sh" "$region_trimmed" "$profile"
+      done
+    done
+    exit 0
+    ;;
+
+
+
   *)
     echo "Unknown review: $REVIEW" >&2
     exit 2
