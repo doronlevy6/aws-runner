@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import boto3
@@ -115,8 +117,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--profile", required=True, help="AWS CLI profile name")
     parser.add_argument(
         "--output",
-        default="outputs/dynamodb_finops_summary.csv",
-        help="Path to the summary CSV (default: outputs/dynamodb_finops_summary.csv)",
+        default=None,
+        help="Path to the summary CSV (default: outputs/dynamodb_finops_<ts>/dynamodb_finops_summary.csv)",
     )
     return parser.parse_args(argv)
 
@@ -409,6 +411,10 @@ def collect_region(session, region: str) -> Tuple[List[Dict], Dict[str, int]]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    default_outdir = os.path.join("outputs", f"dynamodb_finops_{ts}")
+    output_path = args.output or os.path.join(default_outdir, "dynamodb_finops_summary.csv")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     regions = [r.strip() for r in args.region.split(",") if r.strip()]
     if not regions:
@@ -430,7 +436,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for key in total_counts:
             total_counts[key] += counters.get(key, 0)
 
-    write_csv(args.output, all_rows, CSV_FIELDS)
+    write_csv(output_path, all_rows, CSV_FIELDS)
 
     print("=== DynamoDB FinOps Review ===")
     print(f"Profile: {args.profile}")
@@ -438,7 +444,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Tables scanned: {total_counts['total']}")
     print(f"Stable tables (stability<=3): {total_counts['stable']}")
     print(f"Idle tables: {total_counts['idle']}")
-    print(f"CSV written to: {args.output}")
+    print(f"CSV written to: {output_path}")
     return 0
 
 
