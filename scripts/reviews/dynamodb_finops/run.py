@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+כרגע הנתונים שמעניינים זה לראות איזה טבלאות מייצרות הכי הרבה עלויות מבחינת קריאה או כתיבה
+ולראות האם אפשר לעשות להן הקצאה שתוזיל עלויות.
+הנתונים שמעניינים הן הממוצעים ל-30 יום לשנייה והכמויות של האחסון או הבקשות או הקריאות
+תלוי על מה הולך רוב ההוצאות.
+
 DynamoDB FinOps review — Cleaned & Improved
 - Uses Sum for Consumed* metrics (per AWS guidance)
 - Uses Read/WriteThrottleEvents (table + GSI)
@@ -20,7 +25,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -96,56 +101,40 @@ SEC_30D = 30 * 24 * 3600
 
 @dataclass
 class MetricAggregate:
-    # we now store arrays of sums/max for later aggregation
+    period_seconds: int
     sums: List[float]
-    maxs: List[float]
-    p95s: List[float]
-    samples_count: int
 
     @property
     def total_sum(self) -> float:
         return float(sum(self.sums)) if self.sums else 0.0
 
     @property
-    def avg_of_max(self) -> float:
-        return float(sum(self.maxs) / len(self.maxs)) if self.maxs else 0.0
+    def samples_count(self) -> int:
+        return len(self.sums)
+
+    def _per_second_series(self) -> List[float]:
+        if self.period_seconds <= 0:
+            return []
+        return [val / self.period_seconds for val in self.sums]
 
     @property
-    def peak(self) -> float:
-        return float(max(self.maxs)) if self.maxs else 0.0
+    def peak_per_sec(self) -> float:
+        series = self._per_second_series()
+        return max(series) if series else 0.0
 
-    @property
-    def p95(self) -> float:
-        if not self.p95s:
+    def percentile_per_sec(self, percentile: float) -> float:
+        series = self._per_second_series()
+        if not series:
             return 0.0
-        ordered = sorted(self.p95s)
-        k = (len(ordered) - 1) * 0.95
+        ordered = sorted(series)
+        k = (len(ordered) - 1) * (percentile / 100.0)
         f = math.floor(k)
         c = min(f + 1, len(ordered) - 1)
         if f == c:
             return float(ordered[f])
-        d0 = ordered[f] * (c - k)
-        d1 = ordered[c] * (k - f)
-        return float(d0 + d1)
-
-
-@dataclass
-class MetricBundle:
-    # table-level
-    read_7d: MetricAggregate
-    write_7d: MetricAggregate
-    read_30d: MetricAggregate
-    write_30d: MetricAggregate
-    thr_read_7d_sum: float
-    thr_write_7d_sum: float
-    thr_read_30d_sum: float
-    thr_write_30d_sum: float
-
-    # GSI-level (top signals)
-    gsi_top_name_by_read_peak: str
-    gsi_top_read_peak_30d: float
-    gsi_top_name_by_throttle: str
-    gsi_top_throttle_30d_sum: float
+        lower = ordered[f]
+        upper = ordered[c]
+        return float(lower * (c - k) + upper * (k - f))
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -166,11 +155,8 @@ def gather_agg(
     dimensions: List[Dict[str, str]],
     days: int,
     period: int,
-    want_p95: bool = True,
 ) -> MetricAggregate:
-    """Fetch datapoints and aggregate arrays of Sum/Maximum/p95."""
-    stats = ["Sum", "Maximum"]
-    ext = ["p95"] if want_p95 else []
+    """Fetch datapoints (Sum) and normalize to per-second rates."""
     dps = get_metric_statistics_multi(
         cw,
         namespace=DDB_NAMESPACE,
@@ -179,31 +165,17 @@ def gather_agg(
         start=window(days)[0],
         end=window(days)[1],
         period=period,
-        statistics=stats,
-        extended_statistics=ext,
+        statistics=["Sum"],
     )
-    sums, maxs, p95s = [], [], []
-    samples = 0
+    sums: List[float] = []
     for dp in dps:
-        if "Sum" in dp:
-            try:
-                sums.append(float(dp["Sum"]))
-            except Exception:
-                pass
-        if "Maximum" in dp:
-            try:
-                maxs.append(float(dp["Maximum"]))
-            except Exception:
-                pass
-        if isinstance(dp.get("ExtendedStatistics"), dict) and "p95" in dp["ExtendedStatistics"]:
-            try:
-                p95s.append(float(dp["ExtendedStatistics"]["p95"]))
-            except Exception:
-                pass
-        # count a sample if either stat exists
-        if ("Sum" in dp) or ("Maximum" in dp):
-            samples += 1
-    return MetricAggregate(sums=sums, maxs=maxs, p95s=p95s, samples_count=samples)
+        if "Sum" not in dp:
+            continue
+        try:
+            sums.append(float(dp["Sum"]))
+        except Exception:
+            continue
+    return MetricAggregate(period_seconds=period, sums=sums)
 
 
 def fetch_gsi_signals(
@@ -219,18 +191,18 @@ def fetch_gsi_signals(
                 {"Name": "GlobalSecondaryIndexName", "Value": gsi}]
         # Read peak (30d)
         read_30d = gather_agg(
-            cw, "ConsumedReadCapacityUnits", dims, days=30, period=3600, want_p95=False
+            cw, "ConsumedReadCapacityUnits", dims, days=30, period=3600
         )
         # Throttle sum (30d)
         thr_r_30d = gather_agg(
-            cw, "ReadThrottleEvents", dims, days=30, period=3600, want_p95=False
+            cw, "ReadThrottleEvents", dims, days=30, period=3600
         ).total_sum
         thr_w_30d = gather_agg(
-            cw, "WriteThrottleEvents", dims, days=30, period=3600, want_p95=False
+            cw, "WriteThrottleEvents", dims, days=30, period=3600
         ).total_sum
 
-        if read_30d.peak > best_read_peak:
-            best_read_peak = read_30d.peak
+        if read_30d.peak_per_sec > best_read_peak:
+            best_read_peak = read_30d.peak_per_sec
             best_read_name = gsi
         thr_sum = thr_r_30d + thr_w_30d
         if thr_sum > best_thr_sum:
@@ -284,15 +256,15 @@ def collect_table(
     # --- Table-level metrics (7d/30d) ---
     dims_table = [{"Name": "TableName", "Value": table_name}]
 
-    read_7d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 7, 900, True)
-    write_7d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 7, 900, True)
-    read_30d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 30, 3600, True)
-    write_30d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 30, 3600, True)
+    read_7d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 7, 900)
+    write_7d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 7, 900)
+    read_30d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 30, 3600)
+    write_30d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 30, 3600)
 
-    thr_r_7d = gather_agg(cw, "ReadThrottleEvents", dims_table, 7, 900, False).total_sum
-    thr_w_7d = gather_agg(cw, "WriteThrottleEvents", dims_table, 7, 900, False).total_sum
-    thr_r_30d = gather_agg(cw, "ReadThrottleEvents", dims_table, 30, 3600, False).total_sum
-    thr_w_30d = gather_agg(cw, "WriteThrottleEvents", dims_table, 30, 3600, False).total_sum
+    thr_r_7d = gather_agg(cw, "ReadThrottleEvents", dims_table, 7, 900).total_sum
+    thr_w_7d = gather_agg(cw, "WriteThrottleEvents", dims_table, 7, 900).total_sum
+    thr_r_30d = gather_agg(cw, "ReadThrottleEvents", dims_table, 30, 3600).total_sum
+    thr_w_30d = gather_agg(cw, "WriteThrottleEvents", dims_table, 30, 3600).total_sum
 
     # --- Derived: totals & avg/sec (30d) ---
     total_30d_read = read_30d.total_sum
@@ -300,13 +272,13 @@ def collect_table(
     avg_30d_read_per_sec = safe_div(total_30d_read, SEC_30D)
     avg_30d_write_per_sec = safe_div(total_30d_write, SEC_30D)
 
-    # peak 30d from Maximum
-    peak_30d_read = read_30d.peak
-    peak_30d_write = write_30d.peak
+    # peak 30d (per-second)
+    peak_30d_read = read_30d.peak_per_sec
+    peak_30d_write = write_30d.peak_per_sec
 
-    # p95 (7d)
-    p95_7d_read = read_7d.p95
-    p95_7d_write = write_7d.p95
+    # p95 (7d, per-second)
+    p95_7d_read = read_7d.percentile_per_sec(95.0)
+    p95_7d_write = write_7d.percentile_per_sec(95.0)
 
     # stability 7d (peak/avg where avg from Sum/period)
     # compute avg/sec for 7d to make stability meaningful
@@ -314,8 +286,8 @@ def collect_table(
     SEC_7D = 7 * 24 * 3600
     avg_7d_read_per_sec = safe_div(read_7d.total_sum, SEC_7D)
     avg_7d_write_per_sec = safe_div(write_7d.total_sum, SEC_7D)
-    stability_7d_read = stability_ratio(read_7d.peak, avg_7d_read_per_sec)
-    stability_7d_write = stability_ratio(write_7d.peak, avg_7d_write_per_sec)
+    stability_7d_read = stability_ratio(read_7d.peak_per_sec, avg_7d_read_per_sec)
+    stability_7d_write = stability_ratio(write_7d.peak_per_sec, avg_7d_write_per_sec)
 
     # Coverage stats from 30d
     # expected samples = 30d / period (period=3600)
@@ -454,7 +426,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for region in regions:
         all_rows.extend(collect_region(session, region))
 
+    # Write CSV output
     write_csv(output_path, all_rows, CSV_FIELDS)
+    print(f'open "{output_path}"')
 
     print("=== DynamoDB FinOps Review (Clean) ===")
     print(f"Profile: {args.profile}")
