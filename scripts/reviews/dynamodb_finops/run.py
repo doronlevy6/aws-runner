@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""DynamoDB FinOps review.
+"""
+כרגע הנתונים שמעניינים זה לראות איזה טבלאות מייצרות הכי הרבה עלויות מבחינת קריאה או כתיבה
+ולראות האם אפשר לעשות להן הקצאה שתוזיל עלויות.
+הנתונים שמעניינים הן הממוצעים ל-30 יום לשנייה והכמויות של האחסון או הבקשות או הקריאות
+תלוי על מה הולך רוב ההוצאות.
+
+DynamoDB FinOps review — Cleaned & Improved
+- Uses Sum for Consumed* metrics (per AWS guidance)
+- Uses Read/WriteThrottleEvents (table + GSI)
+- Computes avg/sec from totals, stability, burstiness, headroom
+- Fixes BillingMode default and PITR status
+- Emits a concise CSV with actionable recommendations
 
 Usage:
     python3 scripts/reviews/dynamodb_finops/run.py --region us-east-1 --profile prod
-
-Collects table configuration + CloudWatch consumption metrics to highlight
-idle tables and tables that might benefit from provisioned capacity.
 """
 
 from __future__ import annotations
@@ -17,21 +25,20 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, ProfileNotFound
 
-from scripts.common.cloudwatch import (
-    get_metric_statistics_multi,
-    window,
-)
+# These helpers are assumed to exist in your project (unchanged)
+from scripts.common.cloudwatch import get_metric_statistics_multi, window
 from scripts.common.csvio import write_csv
 
 CFG = BotoConfig(retries={"max_attempts": 10, "mode": "standard"})
 DDB_NAMESPACE = "AWS/DynamoDB"
 
+# Final CSV columns (lean & actionable)
 CSV_FIELDS: Sequence[str] = (
     "TableName",
     "BillingMode",
@@ -41,258 +48,335 @@ CSV_FIELDS: Sequence[str] = (
     "TableClass",
     "PITR",
     "GSI_Count",
-    "avg_1d_read",
-    "peak_1d_read",
-    "p95_1d_read",
-    "avg_1d_write",
-    "peak_1d_write",
-    "p95_1d_write",
-    "avg_1d_throttle",
-    "peak_1d_throttle",
-    "p95_1d_throttle",
-    "avgmax_1d_read",
-    "avgmax_1d_write",
-    "avgmax_1d_throttle",
-    "avg_7d_read",
-    "peak_7d_read",
-    "p95_7d_read",
-    "avg_7d_write",
-    "peak_7d_write",
-    "p95_7d_write",
-    "avg_7d_throttle",
-    "peak_7d_throttle",
-    "p95_7d_throttle",
-    "avgmax_7d_read",
-    "avgmax_7d_write",
-    "avgmax_7d_throttle",
-    "avg_30d_read",
+
+    # Core 30d totals & avg/sec
+    "total_30d_read",
+    "total_30d_write",
+    "avg_30d_read_per_sec",
+    "avg_30d_write_per_sec",
+
+    # Peaks & statistics
     "peak_30d_read",
-    "p95_30d_read",
-    "avg_30d_write",
     "peak_30d_write",
-    "p95_30d_write",
-    "avg_30d_throttle",
-    "peak_30d_throttle",
-    "p95_30d_throttle",
-    "avgmax_30d_read",
-    "avgmax_30d_write",
-    "avgmax_30d_throttle",
-    "stability_7d_read",
+    "p95_7d_read",
+    "p95_7d_write",
+    "stability_7d_read",      # peak/avg (7d)
     "stability_7d_write",
-    "stability_7d_p95_ratio",
-    "spike_ratio_7d",
-    "throttle_indicator",
-    "confidence_score",
+
+    # Coverage & throttles
+    "samples_30d_read",
+    "samples_30d_write",
+    "expected_samples_30d",
+    "coverage_ok",
+    "throttle_read_7d_sum",
+    "throttle_write_7d_sum",
+    "throttle_read_30d_sum",
+    "throttle_write_30d_sum",
+
+    # Derived indicators
+    "avg_ops_sec",            # read+write
+    "read_spike_ratio",       # peak/avg (30d)
+    "write_spike_ratio",
+    "headroom_r",             # p95/peak (7d vs 30d peak)
+    "headroom_w",
+
+    # GSI hot-spot signals (optional but very useful)
+    "gsi_top_name_by_read_peak",
+    "gsi_top_read_peak_30d",
+    "gsi_top_name_by_throttle",
+    "gsi_top_throttle_30d_sum",
+
+    # Final decision string
     "recommendation",
-    "Tags",
 )
 
+# Time windows: (days, period seconds)
 TIME_WINDOWS = {
-    "1d": (1, 300),
-    "7d": (7, 900),
+    "7d": (7,   900),
     "30d": (30, 3600),
 }
+
+SEC_30D = 30 * 24 * 3600
 
 
 @dataclass
 class MetricAggregate:
-    avg: float = 0.0
-    peak: float = 0.0
-    p95: float = 0.0
-    spike_count: int = 0
-    samples_count: int = 0
-    avg_max: float = 0.0
+    period_seconds: int
+    sums: List[float]
 
+    @property
+    def total_sum(self) -> float:
+        return float(sum(self.sums)) if self.sums else 0.0
 
-@dataclass
-class MetricBundle:
-    read: Dict[str, MetricAggregate]
-    write: Dict[str, MetricAggregate]
-    throttle: Dict[str, MetricAggregate]
+    @property
+    def samples_count(self) -> int:
+        return len(self.sums)
+
+    def _per_second_series(self) -> List[float]:
+        if self.period_seconds <= 0:
+            return []
+        return [val / self.period_seconds for val in self.sums]
+
+    @property
+    def peak_per_sec(self) -> float:
+        series = self._per_second_series()
+        return max(series) if series else 0.0
+
+    def percentile_per_sec(self, percentile: float) -> float:
+        series = self._per_second_series()
+        if not series:
+            return 0.0
+        ordered = sorted(series)
+        k = (len(ordered) - 1) * (percentile / 100.0)
+        f = math.floor(k)
+        c = min(f + 1, len(ordered) - 1)
+        if f == c:
+            return float(ordered[f])
+        lower = ordered[f]
+        upper = ordered[c]
+        return float(lower * (c - k) + upper * (k - f))
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the DynamoDB FinOps review")
-    parser.add_argument("--region", required=True, help="AWS region (single or CSV list)")
-    parser.add_argument("--profile", required=True, help="AWS CLI profile name")
-    parser.add_argument(
+    p = argparse.ArgumentParser(description="Run the DynamoDB FinOps review")
+    p.add_argument("--region", required=True, help="AWS region (single or CSV list)")
+    p.add_argument("--profile", required=True, help="AWS CLI profile name")
+    p.add_argument(
         "--output",
         default=None,
-        help="Path to the summary CSV (default: outputs/dynamodb_finops_<ts>/dynamodb_finops_summary.csv)",
+        help="Path to CSV (default: outputs/dynamodb_finops_<ts>/dynamodb_finops_summary.csv)",
     )
-    return parser.parse_args(argv)
+    return p.parse_args(argv)
 
 
-def percentile(values: Sequence[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return float(ordered[0])
-    k = (len(ordered) - 1) * (pct / 100.0)
-    f = math.floor(k)
-    c = min(f + 1, len(ordered) - 1)
-    if f == c:
-        return float(ordered[f])
-    d0 = ordered[f] * (c - k)
-    d1 = ordered[c] * (k - f)
-    return float(d0 + d1)
-
-
-def summarize_datapoints(datapoints: Iterable[Dict]) -> MetricAggregate:
-    avg_vals: List[float] = []
-    max_vals: List[float] = []
-    p95_vals: List[float] = []
-    spike_count = 0
-    samples_count = 0
-
-    for dp in datapoints:
-        avg_val = None
-        max_val = None
-        if "Average" in dp:
-            try:
-                avg_val = float(dp["Average"])
-            except (TypeError, ValueError):
-                avg_val = None
-            if avg_val is not None:
-                avg_vals.append(avg_val)
-        if "Maximum" in dp:
-            try:
-                max_val = float(dp["Maximum"])
-            except (TypeError, ValueError):
-                max_val = None
-            if max_val is not None:
-                max_vals.append(max_val)
-        if avg_val is not None or max_val is not None:
-            samples_count += 1
-        if avg_val and max_val and avg_val > 0 and max_val >= avg_val * 2:
-            spike_count += 1
-        ext = dp.get("ExtendedStatistics")
-        if isinstance(ext, dict) and "p95" in ext:
-            try:
-                p95_vals.append(float(ext["p95"]))
-            except (TypeError, ValueError):
-                continue
-
-    avg = sum(avg_vals) / len(avg_vals) if avg_vals else 0.0
-    peak = max(max_vals) if max_vals else 0.0
-    p95 = percentile(p95_vals, 95.0) if p95_vals else 0.0
-    avg_max = sum(max_vals) / len(max_vals) if max_vals else 0.0
-    return MetricAggregate(
-        avg=avg,
-        peak=peak,
-        p95=p95,
-        spike_count=spike_count,
-        samples_count=samples_count,
-        avg_max=avg_max,
+def gather_agg(
+    cw,
+    metric_name: str,
+    dimensions: List[Dict[str, str]],
+    days: int,
+    period: int,
+) -> MetricAggregate:
+    """Fetch datapoints (Sum) and normalize to per-second rates."""
+    dps = get_metric_statistics_multi(
+        cw,
+        namespace=DDB_NAMESPACE,
+        metric_name=metric_name,
+        dimensions=dimensions,
+        start=window(days)[0],
+        end=window(days)[1],
+        period=period,
+        statistics=["Sum"],
     )
+    sums: List[float] = []
+    for dp in dps:
+        if "Sum" not in dp:
+            continue
+        try:
+            sums.append(float(dp["Sum"]))
+        except Exception:
+            continue
+    return MetricAggregate(period_seconds=period, sums=sums)
 
 
-def fetch_metric_bundle(cw, table_name: str) -> MetricBundle:
-    results: Dict[str, Dict[str, MetricAggregate]] = {
-        "read": {},
-        "write": {},
-        "throttle": {},
-    }
-    dimensions = [{"Name": "TableName", "Value": table_name}]
+def fetch_gsi_signals(
+    cw,
+    table_name: str,
+    gsi_names: List[str],
+) -> Tuple[str, float, str, float]:
+    """Return top GSI by read peak and top GSI by throttle sum (30d)."""
+    best_read_name, best_read_peak = "", 0.0
+    best_thr_name, best_thr_sum = "", 0.0
+    for gsi in gsi_names:
+        dims = [{"Name": "TableName", "Value": table_name},
+                {"Name": "GlobalSecondaryIndexName", "Value": gsi}]
+        # Read peak (30d)
+        read_30d = gather_agg(
+            cw, "ConsumedReadCapacityUnits", dims, days=30, period=3600
+        )
+        # Throttle sum (30d)
+        thr_r_30d = gather_agg(
+            cw, "ReadThrottleEvents", dims, days=30, period=3600
+        ).total_sum
+        thr_w_30d = gather_agg(
+            cw, "WriteThrottleEvents", dims, days=30, period=3600
+        ).total_sum
 
-    metric_map = {
-        "read": "ConsumedReadCapacityUnits",
-        "write": "ConsumedWriteCapacityUnits",
-        "throttle": "ThrottledRequests",
-    }
+        if read_30d.peak_per_sec > best_read_peak:
+            best_read_peak = read_30d.peak_per_sec
+            best_read_name = gsi
+        thr_sum = thr_r_30d + thr_w_30d
+        if thr_sum > best_thr_sum:
+            best_thr_sum = thr_sum
+            best_thr_name = gsi
 
-    for label, metric_name in metric_map.items():
-        for window_name, (days, period) in TIME_WINDOWS.items():
-            start, end = window(days)
-            try:
-                datapoints = get_metric_statistics_multi(
-                    cw,
-                    namespace=DDB_NAMESPACE,
-                    metric_name=metric_name,
-                    dimensions=dimensions,
-                    start=start,
-                    end=end,
-                    period=period,
-                    statistics=["Average", "Maximum"],
-                    extended_statistics=["p95"],
-                )
-            except ClientError as exc:
-                code = exc.response.get("Error", {}).get("Code", "Unknown")
-                print(f"    [metrics] {table_name} {window_name} {metric_name} -> {code}", file=sys.stderr)
-                datapoints = []
-            agg = summarize_datapoints(datapoints)
-            results[label][window_name] = agg
+    return best_read_name, best_read_peak, best_thr_name, best_thr_sum
 
-    return MetricBundle(
-        read=results["read"],
-        write=results["write"],
-        throttle=results["throttle"],
-    )
+
+def safe_div(n: float, d: float, default: float = 0.0) -> float:
+    return n / d if d else default
 
 
 def stability_ratio(peak: float, avg: float) -> float:
-    if not avg:
+    """peak/avg with guardrails."""
+    if avg <= 0:
         return 0.0
-    return peak / avg if avg else 0.0
+    return peak / avg
 
 
-def extract_table_metadata(table: Dict) -> Dict[str, Optional[str]]:
-    billing_summary = table.get("BillingModeSummary") or {}
-    billing_mode = billing_summary.get("BillingMode") or table.get("TableStatus")
+def collect_table(
+    session,
+    cw,
+    region: str,
+    table_detail: Dict,
+) -> Dict:
+    # --- Metadata ---
+    table_name = table_detail.get("TableName")
+    billing_summary = table_detail.get("BillingModeSummary") or {}
+    # If missing -> it's PROVISIONED by default per AWS
+    billing_mode = billing_summary.get("BillingMode") or "PROVISIONED"
 
-    pitr_desc = table.get("PointInTimeRecoveryDescription") or {}
-    pitr_status = pitr_desc.get("Status")
-    if not pitr_status:
-        pitr_status = "OFF"
+    tclass_summary = table_detail.get("TableClassSummary") or {}
+    pitr_desc = table_detail.get("PointInTimeRecoveryDescription") or {}
+    pitr_status = (pitr_desc.get("PointInTimeRecoveryStatus") or "OFF").upper()
 
-    gsi_list = table.get("GlobalSecondaryIndexes") or []
-    table_class_summary = table.get("TableClassSummary") or {}
+    gsi_list = table_detail.get("GlobalSecondaryIndexes") or []
+    gsi_names = [g.get("IndexName") for g in gsi_list if g.get("IndexName")]
 
-    return {
-        "TableName": table.get("TableName"),
+    row = {
+        "TableName": table_name,
         "BillingMode": billing_mode,
-        "TableSizeMB": round((table.get("TableSizeBytes", 0) or 0) / (1024 * 1024), 2),
-        "ItemCount": table.get("ItemCount", 0),
-        "TableClass": table_class_summary.get("TableClass"),
+        "Region": region,
+        "TableSizeMB": round((table_detail.get("TableSizeBytes", 0) or 0) / (1024 * 1024), 2),
+        "ItemCount": table_detail.get("ItemCount", 0),
+        "TableClass": tclass_summary.get("TableClass"),
         "PITR": pitr_status,
-        "GSI_Count": len(gsi_list),
+        "GSI_Count": len(gsi_names),
     }
 
+    # --- Table-level metrics (7d/30d) ---
+    dims_table = [{"Name": "TableName", "Value": table_name}]
 
-def render_recommendation(
-    agg: MetricBundle,
-    table_meta: Dict[str, Optional[str]],
-) -> str:
-    read_7d = agg.read.get("7d")
-    write_7d = agg.write.get("7d")
-    read_30d = agg.read.get("30d")
-    write_30d = agg.write.get("30d")
+    read_7d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 7, 900)
+    write_7d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 7, 900)
+    read_30d = gather_agg(cw, "ConsumedReadCapacityUnits", dims_table, 30, 3600)
+    write_30d = gather_agg(cw, "ConsumedWriteCapacityUnits", dims_table, 30, 3600)
 
-    avg_7d_total = (read_7d.avg if read_7d else 0.0) + (write_7d.avg if write_7d else 0.0)
-    avg_30d_total = (read_30d.avg if read_30d else 0.0) + (write_30d.avg if write_30d else 0.0)
+    thr_r_7d = gather_agg(cw, "ReadThrottleEvents", dims_table, 7, 900).total_sum
+    thr_w_7d = gather_agg(cw, "WriteThrottleEvents", dims_table, 7, 900).total_sum
+    thr_r_30d = gather_agg(cw, "ReadThrottleEvents", dims_table, 30, 3600).total_sum
+    thr_w_30d = gather_agg(cw, "WriteThrottleEvents", dims_table, 30, 3600).total_sum
 
-    stability_read = stability_ratio(read_7d.peak, read_7d.avg) if read_7d else 0.0
-    stability_write = stability_ratio(write_7d.peak, write_7d.avg) if write_7d else 0.0
-    stability_indicator = max(stability_read, stability_write)
+    # --- Derived: totals & avg/sec (30d) ---
+    total_30d_read = read_30d.total_sum
+    total_30d_write = write_30d.total_sum
+    avg_30d_read_per_sec = safe_div(total_30d_read, SEC_30D)
+    avg_30d_write_per_sec = safe_div(total_30d_write, SEC_30D)
 
-    if avg_7d_total == 0 and avg_30d_total == 0:
-        base = "Idle table – review for deletion or archive"
-    elif stability_indicator and stability_indicator <= 3:
-        base = "Stable usage – consider switching to Provisioned + Auto Scaling"
-    elif stability_indicator == 0:
-        base = "Stable usage – consider switching to Provisioned + Auto Scaling"
+    # peak 30d (per-second)
+    peak_30d_read = read_30d.peak_per_sec
+    peak_30d_write = write_30d.peak_per_sec
+
+    # p95 (7d, per-second)
+    p95_7d_read = read_7d.percentile_per_sec(95.0)
+    p95_7d_write = write_7d.percentile_per_sec(95.0)
+
+    # stability 7d (peak/avg where avg from Sum/period)
+    # compute avg/sec for 7d to make stability meaningful
+    # Derive avg/sec from sums: (sum of all Sum datapoints) / (seconds in 7d)
+    SEC_7D = 7 * 24 * 3600
+    avg_7d_read_per_sec = safe_div(read_7d.total_sum, SEC_7D)
+    avg_7d_write_per_sec = safe_div(write_7d.total_sum, SEC_7D)
+    stability_7d_read = stability_ratio(read_7d.peak_per_sec, avg_7d_read_per_sec)
+    stability_7d_write = stability_ratio(write_7d.peak_per_sec, avg_7d_write_per_sec)
+
+    # Coverage stats from 30d
+    # expected samples = 30d / period (period=3600)
+    expected_samples_30d = math.floor(SEC_30D / 3600)
+    samples_30d_read = read_30d.samples_count
+    samples_30d_write = write_30d.samples_count
+    coverage_ok = (samples_30d_read >= expected_samples_30d * 0.95) and \
+                  (samples_30d_write >= expected_samples_30d * 0.95)
+
+    # spike ratios (30d): peak/avg_per_sec
+    avg_30d_total_per_sec_read = avg_30d_read_per_sec
+    avg_30d_total_per_sec_write = avg_30d_write_per_sec
+    read_spike_ratio = stability_ratio(peak_30d_read, avg_30d_total_per_sec_read)
+    write_spike_ratio = stability_ratio(peak_30d_write, avg_30d_total_per_sec_write)
+
+    # p95 headroom vs 30d peak (if peak==0 -> 0)
+    headroom_r = safe_div(p95_7d_read, peak_30d_read)
+    headroom_w = safe_div(p95_7d_write, peak_30d_write)
+
+    # overall avg ops/sec
+    avg_ops_sec = avg_30d_read_per_sec + avg_30d_write_per_sec
+
+    # --- GSI signals (top) ---
+    gsi_top_name_by_read_peak, gsi_top_read_peak_30d, gsi_top_name_by_throttle, gsi_top_throttle_30d_sum = ("", 0.0, "", 0.0)
+    if gsi_names:
+        gsi_top_name_by_read_peak, gsi_top_read_peak_30d, gsi_top_name_by_throttle, gsi_top_throttle_30d_sum = \
+            fetch_gsi_signals(cw, table_name, gsi_names)
+
+    # --- Decision rules (keep it transparent) ---
+    # base guards
+    if not coverage_ok:
+        recommendation = "NEED_MORE_DATA"
+    elif (thr_r_7d + thr_w_7d + thr_r_30d + thr_w_30d) > 0:
+        recommendation = "ON_DEMAND | throttles observed"
     else:
-        base = "Variable usage – keep On-Demand"
+        # Stable & sustained => Provisioned + AS
+        stable = (stability_7d_read <= 2.0) and (stability_7d_write <= 2.0)
+        semi_stable = (stability_7d_read <= 3.0) and (stability_7d_write <= 3.0)
+        low_burst = (read_spike_ratio <= 2.0) and (write_spike_ratio <= 2.0)
+        med_burst = (read_spike_ratio <= 4.0) and (write_spike_ratio <= 4.0)
+        sustained = (avg_ops_sec >= 10.0)  # default threshold; tune per account
 
-    table_size_mb = table_meta.get("TableSizeMB") or 0
-    pitr_status = (table_meta.get("PITR") or "").upper()
-    if table_size_mb and table_size_mb > 100 and pitr_status in {"ENABLED", "ENABLING"}:
-        base = base + " | Large table + PITR – review backup costs"
-    return base
+        if stable and low_burst and sustained and (headroom_r <= 0.6) and (headroom_w <= 0.6):
+            recommendation = "PROVISIONED_STRONG (AS target~70%)"
+        elif sustained and (semi_stable or med_burst):
+            recommendation = "PROVISIONED_CAUTIOUS (AS target~70% + alarms)"
+        else:
+            recommendation = "ON_DEMAND"
+
+    # --- Build row ---
+    row.update({
+        "total_30d_read": round(total_30d_read, 2),
+        "total_30d_write": round(total_30d_write, 2),
+        "avg_30d_read_per_sec": round(avg_30d_read_per_sec, 6),
+        "avg_30d_write_per_sec": round(avg_30d_write_per_sec, 6),
+        "peak_30d_read": round(peak_30d_read, 6),
+        "peak_30d_write": round(peak_30d_write, 6),
+        "p95_7d_read": round(p95_7d_read, 6),
+        "p95_7d_write": round(p95_7d_write, 6),
+        "stability_7d_read": round(stability_7d_read, 4),
+        "stability_7d_write": round(stability_7d_write, 4),
+
+        "samples_30d_read": samples_30d_read,
+        "samples_30d_write": samples_30d_write,
+        "expected_samples_30d": expected_samples_30d,
+        "coverage_ok": coverage_ok,
+
+        "throttle_read_7d_sum": int(thr_r_7d),
+        "throttle_write_7d_sum": int(thr_w_7d),
+        "throttle_read_30d_sum": int(thr_r_30d),
+        "throttle_write_30d_sum": int(thr_w_30d),
+
+        "avg_ops_sec": round(avg_ops_sec, 6),
+        "read_spike_ratio": round(read_spike_ratio, 3),
+        "write_spike_ratio": round(write_spike_ratio, 3),
+        "headroom_r": round(headroom_r, 3),
+        "headroom_w": round(headroom_w, 3),
+
+        "gsi_top_name_by_read_peak": gsi_top_name_by_read_peak,
+        "gsi_top_read_peak_30d": round(gsi_top_read_peak_30d, 6),
+        "gsi_top_name_by_throttle": gsi_top_name_by_throttle,
+        "gsi_top_throttle_30d_sum": int(gsi_top_throttle_30d_sum),
+
+        "recommendation": recommendation,
+    })
+    return row
 
 
-def collect_region(session, region: str) -> Tuple[List[Dict], Dict[str, int]]:
+def collect_region(session, region: str) -> List[Dict]:
     dynamodb = session.client("dynamodb", region_name=region, config=CFG)
     cw = session.client("cloudwatch", region_name=region, config=CFG)
 
@@ -302,12 +386,6 @@ def collect_region(session, region: str) -> Tuple[List[Dict], Dict[str, int]]:
         table_names.extend(page.get("TableNames", []))
 
     rows: List[Dict] = []
-    counts = {
-        "total": 0,
-        "stable": 0,
-        "idle": 0,
-    }
-
     for table_name in sorted(table_names):
         try:
             detail = dynamodb.describe_table(TableName=table_name)["Table"]
@@ -316,97 +394,14 @@ def collect_region(session, region: str) -> Tuple[List[Dict], Dict[str, int]]:
             print(f"[{region}] describe_table {table_name} -> {code}", file=sys.stderr)
             continue
 
-        metadata = extract_table_metadata(detail)
-        metadata["Region"] = region
-
-        # Optional: fetch tags (best-effort)
-        table_arn = detail.get("TableArn")
-        if table_arn:
-            try:
-                tag_resp = dynamodb.list_tags_of_resource(ResourceArn=table_arn)
-                tags = {t["Key"]: t.get("Value", "") for t in tag_resp.get("Tags", [])}
-                if tags:
-                    metadata["Tags"] = ";".join(f"{k}={v}" for k, v in sorted(tags.items()))
-            except ClientError as exc:
-                code = exc.response.get("Error", {}).get("Code", "Unknown")
-                print(f"[{region}] list_tags_of_resource {table_name} -> {code}", file=sys.stderr)
-
-        bundle = fetch_metric_bundle(cw, table_name)
-
-        row = dict(metadata)
-
-        for window_name in TIME_WINDOWS.keys():
-            read_agg = bundle.read.get(window_name) or MetricAggregate()
-            write_agg = bundle.write.get(window_name) or MetricAggregate()
-            throttle_agg = bundle.throttle.get(window_name) or MetricAggregate()
-
-            row[f"avg_{window_name}_read"] = round(read_agg.avg, 4)
-            row[f"peak_{window_name}_read"] = round(read_agg.peak, 4)
-            row[f"p95_{window_name}_read"] = round(read_agg.p95, 4)
-            row[f"avgmax_{window_name}_read"] = round(read_agg.avg_max, 4)
-
-            row[f"avg_{window_name}_write"] = round(write_agg.avg, 4)
-            row[f"peak_{window_name}_write"] = round(write_agg.peak, 4)
-            row[f"p95_{window_name}_write"] = round(write_agg.p95, 4)
-            row[f"avgmax_{window_name}_write"] = round(write_agg.avg_max, 4)
-
-            row[f"avg_{window_name}_throttle"] = round(throttle_agg.avg, 4)
-            row[f"peak_{window_name}_throttle"] = round(throttle_agg.peak, 4)
-            row[f"p95_{window_name}_throttle"] = round(throttle_agg.p95, 4)
-            row[f"avgmax_{window_name}_throttle"] = round(throttle_agg.avg_max, 4)
-
-        read_7d = bundle.read.get("7d")
-        write_7d = bundle.write.get("7d")
-
-        p95_sum = (read_7d.p95 if read_7d else 0.0) + (write_7d.p95 if write_7d else 0.0)
-        avg_sum = (read_7d.avg if read_7d else 0.0) + (write_7d.avg if write_7d else 0.0)
-        stability_7d_p95_ratio = (p95_sum / avg_sum) if avg_sum else 0.0
-
-        samples_7d = (read_7d.samples_count if read_7d else 0) + (
-            write_7d.samples_count if write_7d else 0
-        )
-        spikes_7d = (read_7d.spike_count if read_7d else 0) + (
-            write_7d.spike_count if write_7d else 0
-        )
-        spike_ratio_7d = (spikes_7d / samples_7d) if samples_7d else 0.0
-
-        throttle_7d = bundle.throttle.get("7d")
-        throttle_30d = bundle.throttle.get("30d")
-        avg_7d_throttle = throttle_7d.avg if throttle_7d else 0.0
-        avg_30d_throttle = throttle_30d.avg if throttle_30d else 0.0
-        throttle_indicator = (avg_7d_throttle + avg_30d_throttle) / 2.0
-
-        stability_read = stability_ratio(read_7d.peak, read_7d.avg) if read_7d else 0.0
-        stability_write = stability_ratio(write_7d.peak, write_7d.avg) if write_7d else 0.0
-
-        row["stability_7d_read"] = round(stability_read, 4) if stability_read else 0.0
-        row["stability_7d_write"] = round(stability_write, 4) if stability_write else 0.0
-        row["stability_7d_p95_ratio"] = round(stability_7d_p95_ratio, 4)
-        row["spike_ratio_7d"] = round(spike_ratio_7d, 4)
-        row["throttle_indicator"] = round(throttle_indicator, 4)
-
-        recommendation = render_recommendation(bundle, row)
-        row["recommendation"] = recommendation
-        row["confidence_score"] = round(row.get("confidence_score", 0.0), 4)
-
-        if "Tags" not in row:
-            row["Tags"] = ""
-
-        avg_7d_total = (read_7d.avg if read_7d else 0.0) + (write_7d.avg if write_7d else 0.0)
-        write_30d = bundle.write.get("30d")
-        read_30d = bundle.read.get("30d")
-        avg_30d_total = (read_30d.avg if read_30d else 0.0) + (write_30d.avg if write_30d else 0.0)
-        stability_indicator = max(row["stability_7d_read"], row["stability_7d_write"])
-
-        counts["total"] += 1
-        if stability_indicator <= 3 and stability_indicator >= 0:
-            counts["stable"] += 1
-        if avg_7d_total == 0 and avg_30d_total == 0:
-            counts["idle"] += 1
-
-        rows.append(row)
-
-    return rows, counts
+        try:
+            row = collect_table(session, cw, region, detail)
+            rows.append(row)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "Unknown")
+            print(f"[{region}] metrics {table_name} -> {code}", file=sys.stderr)
+            continue
+    return rows
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -428,22 +423,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     all_rows: List[Dict] = []
-    total_counts = {"total": 0, "stable": 0, "idle": 0}
-
     for region in regions:
-        region_rows, counters = collect_region(session, region)
-        all_rows.extend(region_rows)
-        for key in total_counts:
-            total_counts[key] += counters.get(key, 0)
+        all_rows.extend(collect_region(session, region))
 
+    # Write CSV output
     write_csv(output_path, all_rows, CSV_FIELDS)
+    print(f'open "{output_path}"')
 
-    print("=== DynamoDB FinOps Review ===")
+    print("=== DynamoDB FinOps Review (Clean) ===")
     print(f"Profile: {args.profile}")
     print(f"Regions: {', '.join(regions)}")
-    print(f"Tables scanned: {total_counts['total']}")
-    print(f"Stable tables (stability<=3): {total_counts['stable']}")
-    print(f"Idle tables: {total_counts['idle']}")
+    print(f"Tables scanned: {len(all_rows)}")
     print(f"CSV written to: {output_path}")
     return 0
 
